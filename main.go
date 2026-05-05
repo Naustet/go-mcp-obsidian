@@ -1,6 +1,7 @@
 // Package main implements a Model Context Protocol (MCP) server for Obsidian.
 // This server acts as a bridge between MCP clients (such as Claude or Gemini CLI) 
 // and Obsidian via the Obsidian Local REST API plugin.
+// It is designed to be lightweight with zero external dependencies, using only the Go standard library.
 package main
 
 import (
@@ -18,19 +19,35 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
-// debugLog writes troubleshooting information to /tmp/mcp-obsidian.log.
+// debugLog writes troubleshooting information with timestamps to /tmp/mcp-obsidian.log.
+// This is crucial for debugging stdio communication without disrupting the JSON-RPC stream
+// that the AI client expects on stdout. It includes basic log rotation (5MB limit).
 func debugLog(msg string) {
 	logPath := "/tmp/mcp-obsidian.log"
+	
+	// Simple log rotation: truncate if larger than 5MB
+	if info, err := os.Stat(logPath); err == nil && info.Size() > 5*1024*1024 {
+		os.WriteFile(logPath, []byte("[Log rotated]\n"), 0644)
+	}
+
 	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil { return }
 	defer f.Close()
-	fmt.Fprintf(f, "[%s] [PID %d] %s\n", strings.Split(fmt.Sprintf("%v", os.Getpid()), " ")[0], os.Getpid(), msg)
+	
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	fmt.Fprintf(f, "[%s] [PID %d] %s\n", timestamp, os.Getpid(), msg)
 }
 
 // --- MCP / JSON-RPC Types ---
+// These structures define the JSON-RPC 2.0 protocol used by the Model Context Protocol.
 
+// JSONRPCRequest represents an incoming message from the client.
+// The ID field is a pointer to raw JSON so we can distinguish between:
+// - A Request: contains an ID (e.g., "1" or 1)
+// - A Notification: ID is missing (nil), which according to spec should NOT receive a response.
 type JSONRPCRequest struct {
 	JSONRPC string           `json:"jsonrpc"`
 	ID      *json.RawMessage `json:"id,omitempty"`
@@ -38,6 +55,7 @@ type JSONRPCRequest struct {
 	Params  json.RawMessage  `json:"params,omitempty"`
 }
 
+// JSONRPCResponse is the standardized response format back to the client.
 type JSONRPCResponse struct {
 	JSONRPC string           `json:"jsonrpc"`
 	ID      *json.RawMessage `json:"id"`
@@ -45,28 +63,33 @@ type JSONRPCResponse struct {
 	Error   *RPCError        `json:"error,omitempty"`
 }
 
+// RPCError represents a protocol or tool execution error.
 type RPCError struct {
 	Code    int         `json:"code"`
 	Message string      `json:"message"`
 	Data    interface{} `json:"data,omitempty"`
 }
 
+// Tool defines an executable function exposed by the server to the AI model.
 type Tool struct {
 	Name        string      `json:"name"`
 	Description string      `json:"description"`
 	InputSchema interface{} `json:"inputSchema"`
 }
 
+// TextContent is the standard output format for MCP tool results.
 type TextContent struct {
 	Type string `json:"type"`
 	Text string `json:"text"`
 }
 
+// CallToolResult wraps the content returned after a tool execution.
 type CallToolResult struct {
 	Content []TextContent `json:"content"`
 }
 
 // --- Obsidian Client ---
+// This section handles all secure communication with the Obsidian Local REST API.
 
 type ObsidianClient struct {
 	APIKey   string
@@ -77,7 +100,7 @@ type ObsidianClient struct {
 	client   *http.Client
 }
 
-// NewObsidianClient sets up the client with correct authentication and TLS verification.
+// NewObsidianClient initializes a new client with environment-based configuration and TLS settings.
 func NewObsidianClient() *ObsidianClient {
 	apiKey := os.Getenv("OBSIDIAN_API_KEY")
 	protocol := os.Getenv("OBSIDIAN_PROTOCOL")
@@ -90,33 +113,37 @@ func NewObsidianClient() *ObsidianClient {
 		if p, err := strconv.Atoi(portStr); err == nil { port = p }
 	}
 
+	// Prepare the Certificate Pool for HTTPS verification
 	caCertPool, _ := x509.SystemCertPool()
 	if caCertPool == nil { caCertPool = x509.NewCertPool() }
 
-	// Logic to load certificate
+	// Dynamic Certificate Loading Logic
 	var certLoaded bool
 	
-	// 1. Try OBSIDIAN_CA_CERT_PEM (direct string)
+	// 1. Try loading from OBSIDIAN_CA_CERT_PEM (direct PEM string)
 	if pem := os.Getenv("OBSIDIAN_CA_CERT_PEM"); pem != "" {
 		if ok := caCertPool.AppendCertsFromPEM([]byte(pem)); ok {
-			debugLog("Loaded certificate from OBSIDIAN_CA_CERT_PEM")
+			debugLog("Certificate loaded from OBSIDIAN_CA_CERT_PEM")
 			certLoaded = true
 		}
 	}
 	
-	// 2. Try OBSIDIAN_CA_CERT_FILE (file path)
+	// 2. Try loading from OBSIDIAN_CA_CERT_FILE (file path)
 	if !certLoaded {
 		if path := os.Getenv("OBSIDIAN_CA_CERT_FILE"); path != "" {
 			data, err := os.ReadFile(path)
 			if err == nil {
 				if ok := caCertPool.AppendCertsFromPEM(data); ok {
-					debugLog("Loaded certificate from " + path)
+					debugLog("Certificate loaded from " + path)
 					certLoaded = true
 				}
+			} else {
+				debugLog("Error reading certificate file: " + err.Error())
 			}
 		}
 	}
 	
+	// Option to skip verification (useful for local self-signed certs)
 	skipVerify := os.Getenv("OBSIDIAN_SKIP_VERIFY") == "true"
 
 	httpClient := &http.Client{}
@@ -144,16 +171,21 @@ func NewObsidianClient() *ObsidianClient {
 	}
 }
 
+// doRequest performs an authenticated HTTP request to the Obsidian API.
 func (c *ObsidianClient) doRequest(method, path string, body io.Reader, headers map[string]string) ([]byte, error) {
 	if c.APIKey == "" { return nil, fmt.Errorf("OBSIDIAN_API_KEY is missing") }
 	url := c.BaseURL + path
 	req, err := http.NewRequest(method, url, body)
 	if err != nil { return nil, err }
+	
+	// Authentication via Bearer token
 	req.Header.Set("Authorization", "Bearer "+c.APIKey)
 	for k, v := range headers { req.Header.Set(k, v) }
+	
 	resp, err := c.client.Do(req)
 	if err != nil { return nil, err }
 	defer resp.Body.Close()
+	
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(b))
@@ -161,7 +193,8 @@ func (c *ObsidianClient) doRequest(method, path string, body io.Reader, headers 
 	return io.ReadAll(resp.Body)
 }
 
-// --- Obsidian API Methods ---
+// --- Obsidian API Tool Handlers ---
+// These methods map MCP tool calls to specific Obsidian Local REST API endpoints.
 
 func (c *ObsidianClient) ListFilesInVault() (interface{}, error) {
 	data, err := c.doRequest("GET", "/vault/", nil, nil)
@@ -205,7 +238,12 @@ func (c *ObsidianClient) PutContent(filepath, content string) error {
 }
 
 func (c *ObsidianClient) PatchContent(filepath, operation, targetType, target, content string) error {
-	headers := map[string]string{"Content-Type": "text/markdown", "Operation": operation, "Target-Type": targetType, "Target": url.QueryEscape(target)}
+	headers := map[string]string{
+		"Content-Type": "text/markdown", 
+		"Operation": operation, 
+		"Target-Type": targetType, 
+		"Target": url.QueryEscape(target),
+	}
 	_, err := c.doRequest("PATCH", "/vault/"+url.PathEscape(filepath), strings.NewReader(content), headers)
 	return err
 }
@@ -252,6 +290,7 @@ func (c *ObsidianClient) GetRecentChanges(limit, days int) (interface{}, error) 
 
 // --- Server Definitions ---
 
+// List of all tools exposed by the server to the AI model.
 var tools = []Tool{
 	{Name: "obsidian_list_files_in_vault", Description: "List all files and folders in the root directory.", InputSchema: map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}},
 	{Name: "obsidian_list_files_in_dir", Description: "List files in a specific directory.", InputSchema: map[string]interface{}{"type": "object", "properties": map[string]interface{}{"dirpath": map[string]interface{}{"type": "string"}}, "required": []string{"dirpath"}}},
@@ -268,7 +307,7 @@ var tools = []Tool{
 	{Name: "obsidian_get_recent_changes", Description: "List recently modified files.", InputSchema: map[string]interface{}{"type": "object", "properties": map[string]interface{}{"limit": map[string]interface{}{"type": "integer"}}}},
 }
 
-// handleRequest processes JSON-RPC requests.
+// handleRequest processes incoming JSON-RPC requests from the MCP client.
 func handleRequest(client *ObsidianClient, req JSONRPCRequest) (interface{}, error) {
 	switch req.Method {
 	case "initialize":
@@ -280,7 +319,7 @@ func handleRequest(client *ObsidianClient, req JSONRPCRequest) (interface{}, err
 		}, nil
 	case "notifications/initialized":
 		debugLog("Received initialized notification (ignoring per protocol)")
-		return nil, nil 
+		return nil, nil // No response required for notifications
 	case "tools/list":
 		debugLog("Processing 'tools/list'")
 		return map[string]interface{}{"tools": tools}, nil
@@ -298,7 +337,7 @@ func handleRequest(client *ObsidianClient, req JSONRPCRequest) (interface{}, err
 	}
 }
 
-// callTool routes MCP tool calls to the correct Obsidian method.
+// callTool routes MCP tool calls to the appropriate Obsidian API method.
 func callTool(client *ObsidianClient, name string, args map[string]interface{}) (interface{}, error) {
 	switch name {
 	case "obsidian_list_files_in_vault": return client.ListFilesInVault()
@@ -325,11 +364,12 @@ func callTool(client *ObsidianClient, name string, args map[string]interface{}) 
 	return nil, fmt.Errorf("unknown tool: %s", name)
 }
 
-// runStdio implements Stdio transport for MCP.
+// runStdio implements the Stdio transport mechanism for MCP.
+// It reads line-by-line from stdin and writes JSON responses to stdout.
 func runStdio(client *ObsidianClient) {
 	debugLog("Starting stdio loop")
 	scanner := bufio.NewScanner(os.Stdin)
-	// Increase buffer to 1MB to handle large JSON objects.
+	// Increase buffer size to 1MB to handle large JSON payloads during initialization.
 	const maxCap = 1024 * 1024
 	buf := make([]byte, maxCap); scanner.Buffer(buf, maxCap)
 
@@ -340,6 +380,9 @@ func runStdio(client *ObsidianClient) {
 		}
 
 		result, err := handleRequest(client, req)
+		
+		// IMPORTANT: JSON-RPC notifications (no ID) MUST NOT receive a response.
+		// Responding to a notification will break the protocol and cause clients to disconnect.
 		if req.ID == nil {
 			debugLog("Notification handled without response")
 			continue
@@ -358,25 +401,36 @@ func runStdio(client *ObsidianClient) {
 	debugLog("Stdio loop terminated")
 }
 
-// loadEnv loads .env files manually to avoid external dependencies.
+// loadEnv manually parses .env files to keep the binary zero-dependency.
+// It searches in the current directory and the directory where the binary is located.
 func loadEnv(filename string) {
 	debugLog("Attempting to load .env...")
 	searchPaths := []string{"."}
 	exe, err := os.Executable()
 	if err == nil { searchPaths = append(searchPaths, filepath.Dir(exe)) }
+	
 	for _, p := range searchPaths {
-		f, err := os.Open(filepath.Join(p, filename))
+		fullPath := filepath.Join(p, filename)
+		debugLog("Checking path: " + fullPath)
+		f, err := os.Open(fullPath)
 		if err == nil {
 			scanner := bufio.NewScanner(f)
 			for scanner.Scan() {
 				l := strings.TrimSpace(scanner.Text())
 				if l == "" || strings.HasPrefix(l, "#") { continue }
 				parts := strings.SplitN(l, "=", 2)
-				if len(parts) == 2 { os.Setenv(strings.TrimSpace(parts[0]), strings.Trim(strings.TrimSpace(parts[1]), `"'`)) }
+				if len(parts) == 2 { 
+					key := strings.TrimSpace(parts[0])
+					val := strings.Trim(strings.TrimSpace(parts[1]), `"'`)
+					os.Setenv(key, val)
+				}
 			}
-			f.Close(); debugLog("Loaded .env from: " + p); break
+			f.Close()
+			debugLog("Loaded .env from: " + fullPath)
+			return
 		}
 	}
+	debugLog("No .env file found in search paths")
 }
 
 func main() {
@@ -384,11 +438,13 @@ func main() {
 	loadEnv(".env")
 	client := NewObsidianClient()
 	
+	// Choose transport mode based on environment variable
 	if os.Getenv("MCP_TRANSPORT") == "stdio" {
 		runStdio(client)
 		return
 	}
 	
+	// Fallback to HTTP Web Server mode
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost { return }
 		var req JSONRPCRequest

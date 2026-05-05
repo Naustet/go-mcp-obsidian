@@ -25,7 +25,7 @@ The easiest way to use this tool with `gemini-cli` is by adding the configuratio
 2. Enable it and copy your **API Key**.
 3. **Security (Highly Recommended):** 
    - Go to `Settings` -> `Local REST API` -> `How to access`.
-   - Click the link to download your internal certificate (usually `obsidian.crt`).
+   - Click the link to download your internal certificate (usually `obsidian-local-rest-api.crt`).
    - Place this file in the same folder as your `mcp-obsidian` binary.
 
 ### 3. Add to Gemini CLI
@@ -47,7 +47,7 @@ Add the `env` block with your key and chosen security method:
       "OBSIDIAN_API_KEY": "YOUR_API_KEY_HERE",
       "MCP_TRANSPORT": "stdio",
       "OBSIDIAN_PROTOCOL": "https",
-      "OBSIDIAN_CA_CERT_FILE": "/full/path/to/obsidian.crt"
+      "OBSIDIAN_CA_CERT_FILE": "/full/path/to/obsidian-local-rest-api.crt"
     }
   }
 }
